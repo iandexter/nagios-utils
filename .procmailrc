@@ -1,0 +1,13 @@
+# Procmail recipe for redirecting acknowledgement emails. Requires whitelist.
+
+LOGFILE=/var/lib/nagios/procmailrc.log
+DEFAULT=$HOME/Maildir
+MAILDIR=${DEFAULT}
+VERBOSE=yes
+FROM=`/usr/bin/formail -z -xFrom: | /bin/sed 's/\([a-z]\+\|[a-z0-9]\+\)\(\..*\|@.*\)/\1/'`
+WHITELIST=/var/tmp/whitelist
+NAGIOS_HOST=`/usr/bin/formail -z -xSubject: | /bin/awk '{print $NF}' | /bin/sed 's/[^a-zA-Z0-9].*$//' \
+            | /usr/bin/tr [A-Z] [a-z]`
+:0
+* ? /bin/grep -F -i -x -q "$FROM" $WHITELIST
+| /usr/bin/formail -c -z -XFrom: -XSubject: | /usr/local/nagios/bin/processmail.pl
