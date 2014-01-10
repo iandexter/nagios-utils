@@ -2,7 +2,9 @@
 #
 # Route SMS to email. Pipe to processmail.pl.
 
+
 use strict;
+use warnings;
 
 use POSIX qw(setsid strftime);
 use Sys::Hostname;
@@ -11,220 +13,250 @@ use Data::Dumper;
 use Tie::File;
 use File::Copy;
 
+our $VERSION = 1.7;
+
 my $debug = 0;
 
 ### Daemon
 my $pid;
 my $time_to_die = 0;
-my $chroot_jail = "/var/tmp/sms";
-my $sleep_time = 10;
+my $chroot_jail = '/var/tmp/sms';
+my $sleep_time  = 10;
 
 ### Logging
 my $hostname = hostname;
 my $progname = basename($0);
-my $logfile = "/var/log/$progname.log";
+my $logfile  = "/var/log/$progname.log";
 
 ### SMS
-my $spool_dir = "/var/spool/sms";
+my $spool_dir    = '/var/spool/sms';
 my $incoming_sms = "$spool_dir/incoming";
 my $outgoing_sms = "$spool_dir/outgoing";
-my $sent_sms = "$spool_dir/sent";
-my $failed_sms = "$spool_dir/failed";
-my @sms_files = ();
+my $sent_sms     = "$spool_dir/sent";
+my $failed_sms   = "$spool_dir/failed";
+my @sms_files    = ();
 
-my $alias_file = "/etc/postfix/aliases";
-my %aliases = ();
+my $alias_file = '/etc/postfix/aliases';
+my %aliases    = ();
 
-my $txt;
 my @sms = ();
-my @body = ();
-my %args = ();
 
-my $to = '';
-my $from = '';
-my $subject = '';
-my $bodytext = '';
+my $to;
+my $from;
+my $subject;
+my $bodytext;
 
 my $uid;
 
-
 ### Daemon
-sub signal_handler { $time_to_die = 1; }
+sub signal_handler { $time_to_die = 1; return; }
 $SIG{INT} = $SIG{TERM} = $SIG{HUP} = \&signal_handler;
 
 sub daemonize {
-        if ($debug) {
-                chroot($chroot_jail) || die "Cannot chroot to $chroot_jail: $!";
-        } else {
-                chdir("/") || die "Cannot chdir to \/: $!";
-        }
-        $pid = fork;
-        exit if ($pid);
-        die "Cannot fork: $!" unless defined($pid);
-        setsid || die "Cannot start new session: $!";
-        logMessage("Started $progname");
+    if ($debug) {
+        chroot($chroot_jail) || die "Cannot chroot to $chroot_jail: $!\n";
+    }
+    else {
+        chdir("/") || die "Cannot chdir to \/: $!\n";
+    }
+    $pid = fork;
+    exit if ($pid);
+    die "Cannot fork: $!\n" unless defined($pid);
+    setsid || die "Cannot start new session: $!\n";
+    logMessage("Started $progname");
+    return $$;
 }
 
 ### Logging
 sub logMessage {
-        my ($msg) = @_;
-        my $timestamp = strftime( "%b %e %T",localtime( time() ) );
-        open(LOGFILE,">>$logfile") || die "Cannot open $logfile: $!";
-        print LOGFILE "$timestamp $hostname $progname" . "[$$]: $msg\n";
-        close(LOGFILE);
+    my ($msg) = @_;
+    my $timestamp = strftime( "%b %e %T", localtime( time() ) );
+    open my $logfile, '>>', $logfile || die "Cannot open $logfile: $!\n";
+    print $logfile "$timestamp $hostname $progname" . "[$$]: $msg\n";
+    close $logfile;
+    return;
 }
 
 ### SMS
+sub createDirs {
+    my @dirs = ( $incoming_sms, $outgoing_sms, $sent_sms, $failed_sms );
+    foreach my $dir (@dirs) {
+        if ( !-d $dir ) {
+            mkdir $dir;
+            chown 0, 99, $dir;
+            chmod 0755, $dir;
+        }
+    }
+    return;
+}
+
 sub loadFiles {
-        opendir(SMSDIR, $incoming_sms) || die "Cannot open $incoming_sms: $!";
-        @sms_files = grep { /GSM1.*/ } readdir(SMSDIR);
-        close(SMSDIR);
+    opendir my $smsdir, $incoming_sms || die "Cannot open $incoming_sms: $!\n";
+    @sms_files = grep { /GSM1.*/mx } readdir $smsdir;
+    close $smsdir;
+    return;
 }
 
 sub pushAliases {
-        open(FH,"<$alias_file") || die "Cannot open $alias_file: $!";
-        while(<FH>) {
-                chomp;
-                s/^\#//;
-                s/\:\s+/\:/g;
-                s/\,\s+/\,/g;
-                s/\|\/usr\/local\/bin\/sendsmsFromLN\ //g;
-                s/\"(\d+|\+\d+)\"/$1/g;
-                s/\+(\d+)/$1/g;
-                my ($user, $alias) = split /:/;
-                push( @{$aliases{$user}}, $alias );
-        }
-        close(FH);
+    open my $fh, '<', $alias_file || die "Cannot open $alias_file: $!\n";
+    while (<$fh>) {
+        chomp;
+        s/^\#//mx;
+        s/(\:|\,)\s+/$1/mxg;
+        s/\"(\s+\||\|).*?sendsmsFromLN.*?\s+(\d+|\+\d+).*?\"/$2/mxg;
+        s/(\:|\,)(63|0|\+63)/$1/mxg;
+        my ( $user, $alias ) = split /:/mx;
+        my @multi = split /,/mx, $alias;
+        push( @{ $aliases{$user} }, @multi );
+    }
+    close $fh;
+    return;
 }
 
-sub checkFrom{
-        my ($value) = @_;
+sub checkFrom {
+    my ($value) = @_;
 
-        my @keys = grep { $aliases{$_}[0] eq lc($value) } keys %aliases;
-        return $keys[0];
+    my @keys = grep { $aliases{$_}[0] eq lc($value) } keys %aliases;
+    return $keys[0];
 }
 
 sub getDelimiter {
-        my (@text) = @_;
-        my $i = 0;
+    my (@text) = @_;
+    my $i = 0;
 
-        foreach (@text) { $i++; last if ($_ =~ /^$/); }
-        return $i;
+    foreach (@text) { $i++; last if ( $_ =~ /^$/mx ); }
+    return $i;
 }
 
 sub removeJunk {
-        my ($txt) = @_;
-        my @sms = ();
-        my @body = ();
+    my ($txt) = @_;
+    my @sms   = ();
+    my @body  = ();
 
-        tie @sms, 'Tie::File', $txt;
-        my $i = getDelimiter(@sms);
-        my $len = scalar @sms - 1;
-        @body = @sms[0,$i..$len];
-        return @body;
+    tie @sms, 'Tie::File', $txt;
+    my $i   = getDelimiter(@sms);
+    my $len = scalar @sms - 1;
+    @body = @sms[ 0, $i .. $len ];
+    return @body;
 }
 
 sub moveFailed {
-        my ($txt) = @_;
+    my ($txt) = @_;
 
-        my ($new_loc) = $txt;
-        $new_loc =~ s/$incoming_sms/$failed_sms/;
-        move($txt,$new_loc);
+    my ($new_loc) = $txt;
+    $new_loc =~ s/$incoming_sms/$failed_sms/mx;
+    move( $txt, $new_loc );
+    return;
 }
 
-
 sub isNagios {
-        my (@sms) = @_;
-        my $nagios = "nagios\@";
+    my (@sms) = @_;
+    my $nagios = "nagios\@";
 
-        my ($index) = grep { $sms[$_] =~ /$nagios/ } 0..$#sms;
-        return $index;
+    my ($index) = grep { $sms[$_] =~ /$nagios/mx } 0 .. $#sms;
+    return $index;
 }
 
 sub sendMail {
-        my ($mail_from, $rcpt_to, $subject, $body) = @_;
-        my $sendmail = "/usr/sbin/sendmail -t -r $mail_from";
+    my ( $mail_from, $rcpt_to, $subject, $body ) = @_;
+    my $sendmail = "/usr/sbin/sendmail -t -r $mail_from";
 
-        open(SENDMAIL, "|$sendmail") || die("SENDMAIL ERROR: $!\n");
-        print SENDMAIL ("From: $mail_from\n");
-        print SENDMAIL ("To: $rcpt_to\n");
-        print SENDMAIL ("Subject: $subject\n\n");
-        print SENDMAIL ("$body\n");
-        close(SENDMAIL);
+    open my $sendmail_fh, '|-', $sendmail || die "SENDMAIL ERROR: $!\n";
+    print $sendmail_fh "From: $mail_from\n";
+    print $sendmail_fh "To: $rcpt_to\n";
+    print $sendmail_fh "Subject: $subject\n\n";
+    print $sendmail_fh "$body\n";
+    close $sendmail_fh;
+    return;
 }
-
 
 ### Main
 
 daemonize;
-until($time_to_die) {
+until ($time_to_die) {
 
-        loadFiles;
-        pushAliases;
+    createDirs;
+    loadFiles;
+    pushAliases;
 
-        foreach $txt (@sms_files) {
-                $txt =~ s/^/$incoming_sms\//;
+    foreach my $txt (@sms_files) {
+        $txt =~ s|^|$incoming_sms/|mx;
 
-                @sms = removeJunk($txt);
+        @sms = removeJunk($txt);
 
-                $from = $sms[0];
-                $from =~ s/.*:\ (.*)/$1/;
+        $from = $sms[0];
+        $from =~ s/.*:\ (.*)/$1/mx;
+        $from =~ s/(63|0|\+63)//mx;
 
-                $uid = checkFrom($from);
+        $uid = checkFrom($from);
 
-                if (defined $uid) {
-                        my (@email) = split /,/,$aliases{$uid}[1];
-                        $from = $email[1];
-                } else {
-                        moveFailed($txt);
-                        logMessage("Not in the whitelist of allowed senders: $from");
-                        next;
-                }
-
-                if (defined isNagios(@sms)) {
-                        $to = $sms[isNagios(@sms)];
-                        $to =~ s/.*:\ (.*)/$1/;
-                        $to =~ s/$/\.asiandevbank\.org/;
-                        my (@subject_line) = split /\ /,$sms[1];
-                        if ($sms[1] =~ /Host/) {
-                                $subject = "$subject_line[0] Re: ** $subject_line[2] $subject_line[1] \
-                                            alert for $subject_line[3]\! **";
-                        } else {
-                                $subject = "$subject_line[0] Re: ** $subject_line[1] alert - $subject_line[2] \
-                                           is $subject_line[1] **";
-                        }
-                } else {
-                        if (defined $aliases{lc($sms[1])}) {
-                                my (@email) = split /,/,$aliases{lc($sms[1])}[1];
-                                $to = $email[1];
-                                @email = split /,/,$aliases{$uid}[1];
-                                $subject = "SMS from $email[0]: $sms[2]";
-                                $from = "$uid\@$hostname";
-                        } else {
-                                moveFailed($txt);
-                                logMessage("Not a valid uid or email address: $txt");
-                                next;
-                        }
-                }
-
-                @body = @sms[3,scalar @sms - 1];
-                $bodytext = join("\n",@body);
-
-                logMessage("File:    $txt") if $debug;
-                logMessage("From:    $from") if $debug;
-                logMessage("To:      $to") if $debug;
-                logMessage("Subject: $subject") if $debug;
-                ### logMessage("\n$bodytext\n") if $debug;
-
-                sendMail($from,$to,$subject,$bodytext);
-                logMessage("Email from $from sent to $to.");
-
-                my ($new_loc) = $txt;
-                $new_loc =~ s/$incoming_sms/$sent_sms/;
-                move($txt,$new_loc);
+        if ( defined $uid ) {
+            my (@email) = split /,/mx, $aliases{$uid}[1];
+            $from = $email[1];
+        }
+        else {
+            moveFailed($txt);
+            logMessage("Not in the whitelist of allowed senders: $from");
+            next;
         }
 
-        sleep($sleep_time);
+        if ( defined isNagios(@sms) ) {
+            $to = $sms[ isNagios(@sms) ];
+            $to =~ s/.*:\ (.*)/$1/mx;
+            $to =~ s/$/\.asiandevbank\.org/mx;
+            my (@subject_line) = split /\ /mx, $sms[1];
+            if ( $sms[1] =~ /Host/mx ) {
+                $subject = sprintf "%s Re: ** %s %s alert for %s\! **",
+                  $subject_line[0], $subject_line[2], $subject_line[1],
+                  $subject_line[3];
+            } else {
+                $subject = sprintf "%s Re: ** %s alert - %s is %s **",
+                  $subject_line[0], $subject_line[1], $subject_line[2],
+                  $subject_line[1];
+            }
+        } else {
+            if ( defined $aliases{ lc( $sms[1] ) } ) {
+                my $to_alias = $aliases{ lc( $sms[1] ) }[1];
+
+                $subject = $sms[2];
+                $subject =~ s/.*?\:(.*?)/$1/mxg;
+                $subject =~ s/^\s+(.*?)/$1/mxg;
+                $subject = sprintf "SMS from %s: %s", $to_alias, $subject;
+
+                $to   = $aliases{ lc( $sms[1] ) }[2];
+                $from = "$uid\@$hostname";
+            } else {
+                moveFailed($txt);
+                logMessage("Not a valid uid or email address: $txt");
+                next;
+            }
+        }
+
+        $bodytext = join( "\n", @sms[ 3 .. $#sms ] );
+
+        if ($debug) {
+            logMessage("File:    $txt");
+            logMessage("From:    $from");
+            logMessage("To:      $to");
+            logMessage("Subject: $subject");
+        }
+
+        if ( defined $to && defined $from ) {
+            sendMail( $from, $to, $subject, $bodytext );
+            logMessage("Email from $from sent to $to.");
+        }
+        else {
+            moveFailed($txt);
+            logMessage("Not a valid uid or email address: $txt");
+            next;
+        }
+
+        my ($new_loc) = $txt;
+        $new_loc =~ s/$incoming_sms/$sent_sms/mx;
+        move( $txt, $new_loc );
+    }
+
+    sleep($sleep_time);
 }
 
 __END__
@@ -235,7 +267,7 @@ sms2emaild - Route SMS to email
 
 =head1 SYNOPSIS
 
-/etc/init.d/sms2emaild {start|stop|restart}
+C</etc/init.d/sms2emaild {start|stop|restart}>
 
 =head1 DESCRIPTION
 
